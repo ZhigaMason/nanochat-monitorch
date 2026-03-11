@@ -418,7 +418,7 @@ inspector = PyTorchInspector(
         lenses=[
             LossMetrics(
                 loss_fn=model,
-                # metrics=['val_bpb'],
+                metrics=['val_bpb'],
             ),
             ParameterGradientActivation(parameters=['weight']),
             ParameterUpdateGeometry(optimizer, parameters=['weight']),
@@ -440,7 +440,7 @@ while True:
         with disable_fp8(model):
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
-        #inspector.push_metric(name='val_bpb', value=val_bpb, running=True)
+        inspector.push_metric(name='val_bpb', value=val_bpb, running=True)
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         wandb_run.log({
