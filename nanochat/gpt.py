@@ -147,7 +147,7 @@ class Block(nn.Module):
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        x = self.mlp(norm(x))
         return x
 
 
