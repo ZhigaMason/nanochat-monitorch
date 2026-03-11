@@ -8,8 +8,10 @@ dependencies = [
     "datasets>=4.0.0",
     "fastapi>=0.117.1",
     "ipykernel>=7.1.0",
+    "jupyter>=1.1.1",
     "kernels>=0.11.7",
     "matplotlib>=3.10.8",
+    "monitorch>=0.1.0",
     "psutil>=7.1.0",
     "python-dotenv>=1.2.1",
     "regex>=2025.9.1",
@@ -19,7 +21,7 @@ dependencies = [
     "tabulate>=0.9.0",
     "tiktoken>=0.11.0",
     "tokenizers>=0.22.0",
-    "torch==2.9.1",
+    "torch[cpu]==2.9.1",
     "transformers>=4.57.3",
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
@@ -72,3 +74,9 @@ conflicts = [
         { extra = "gpu" },
     ],
 ]
+
+[tool.ruff]
+lint.select = []
+lint.ignore = ["ALL"]
+format.exclude = ["*"]
+exclude = ["*"]

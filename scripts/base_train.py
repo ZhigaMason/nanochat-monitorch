@@ -34,6 +34,10 @@ from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
+from monitorch.inspector import PyTorchInspector
+from monitorch.lens import LossMetrics, ParameterGradientActivation, ParameterUpdateGeometry
+from monitorch.visualizer import RecorderVisualizer
+
 print_banner()
 
 # -----------------------------------------------------------------------------
@@ -77,6 +81,9 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# monitorch
+parser.add_argument("--tick-every", type=int, default=32, help="Tick monitorch inspector every N steps.")
+
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -404,6 +411,22 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+
+
+inspector = PyTorchInspector(
+        module=model,
+        lenses=[
+            LossMetrics(
+                loss_fn=model,
+                # metrics=['val_bpb'],
+            ),
+            ParameterGradientActivation(parameters=['weight']),
+            ParameterUpdateGeometry(optimizer, parameters=['weight']),
+        ],
+        visualizer=RecorderVisualizer('log.pkl'),
+        is_active_fn=lambda _:model.training
+)
+
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -417,6 +440,7 @@ while True:
         with disable_fp8(model):
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
+        #inspector.push_metric(name='val_bpb', value=val_bpb, running=True)
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         wandb_run.log({
@@ -574,6 +598,10 @@ while True:
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
     step += 1
+
+    # Tick inspector
+    if last_step or (args.tick_every > 0 and step % args.tick_every == 0):
+        inspector.tick()
 
     # The garbage collector is sadly a little bit overactive and for some poorly understood reason,
     # it spends ~500ms scanning for cycles quite frequently, just to end up cleaning up very few tiny objects each time.
