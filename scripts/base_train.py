@@ -65,8 +65,8 @@ parser.add_argument("--device-batch-size", type=int, default=32, help="per-devic
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
-parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--weight-decay", type=float, default=0.28, help="weight decay for AdamW optimizer")
+parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (AdamW)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
@@ -295,7 +295,7 @@ batch_ratio = total_batch_size / B_REF # B/B_ref
 if batch_ratio != 1.0:
     # SGD: linear scaling with batch size is standard (not used in nanochat)
     # AdamW: sqrt scaling is standard: η ∝ √(B/B_ref)
-    # Muon: we will use the same scaling for Muon as for AdamW: η ∝ √(B/B_ref) (not studied carefully, assumption!)
+    # AdamW: we will use the same scaling for AdamW: η ∝ √(B/B_ref)
     batch_lr_scale = batch_ratio ** 0.5 # η ∝ √(B/B_ref)
     print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
 
@@ -304,19 +304,19 @@ if batch_ratio != 1.0:
 # Central idea of the paper is that T_epoch = B/(η·λ·D) should remain constant.
 # Above, we used learning rate scaling η ∝ √(B/B_ref). So it's a matter of ~10 lines of math to derive that to keep T_epoch constant, we need:
 # λ = λ_ref · √(B/B_ref) · (D_ref/D)
-# Note that these papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
+# Note that weight decay scaling follows AdamW theory from the literature.
 weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
 if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+# Initialize the Optimizer (AdamW for all parameters)
 optimizer = model.setup_optimizer(
     # AdamW hyperparameters
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
-    # Muon hyperparameters
+    # Matrix parameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
 )
@@ -374,13 +374,7 @@ def get_lr_multiplier(it):
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
 
-# Momentum scheduler for Muon optimizer (warms up to 0.97 over the first 400 steps)
-def get_muon_momentum(it):
-    frac = min(it / 400, 1)
-    momentum = (1 - frac) * 0.85 + frac * 0.97
-    return momentum
-
-# Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
+# Weight decay scheduler for AdamW optimizer (cosine decay to zero over the course of training)
 def get_weight_decay(it):
     return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
 
@@ -534,13 +528,10 @@ while True:
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(step)
+    weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
+        group["weight_decay"] = weight_decay
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
