@@ -36,6 +36,9 @@ from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
 print_banner()
 
+from monitorch.inspector import PyTorchInspector
+from monitorch import lens
+from monitorch.visualizer import RecorderVisualizer
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain base model")
@@ -77,6 +80,10 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# monitorch
+parser.add_argument("--tick-every", type=int, default=100, help="Tick inspector every")
+# parser.add_argument("--is-active", type=int, default=1, help="Passed to is_active_fn of monitorch.PyTorchInspector")
+
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -412,6 +419,19 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+inspector = PyTorchInspector(
+        module = model,
+        lenses=[
+            lens.LossMetrics(loss_fn=model),
+            lens.ParameterGradientActivation(parameters=['weight']),
+            lens.ParameterGradientGeometry(parameters=['weight']),
+            lens.ParameterUpdateGeometry(optimizer=optimizer, parameters=['weight']),
+            lens.ParameterNorm(parameters=['weight']),
+        ],
+        is_active_fn=lambda n: model.training, # we are interested only in training values
+        visualizer=RecorderVisualizer('logs.pkl')
+)
+
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -434,6 +454,7 @@ while True:
             "val/bpb": val_bpb,
         })
         model.train()
+        inspector.push_metric('val_pbp', val_bpb)
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
@@ -498,6 +519,8 @@ while True:
             rank=ddp_rank,
         )
 
+    if last_step or (step > 0 and step % args.tick_every == 0):
+        inspector.tick()
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
         break
