@@ -37,6 +37,8 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Use ReLU instead of 3*sigmoid for the value embedding gate (unbounded, easier to train)
+    ve_gate_relu: bool = False
 
 
 def norm(x):
@@ -78,6 +80,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate_relu = config.ve_gate_relu
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -91,7 +94,10 @@ class CausalSelfAttention(nn.Module):
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
+            if self.ve_gate_relu:
+                gate = F.relu(self.ve_gate(x[..., :self.ve_gate_channels]))          # (B, T, n_kv_head), range [0, ∞)
+            else:
+                gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
             v = v + gate.unsqueeze(-1) * ve
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
@@ -371,30 +377,38 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, value_embeds_lr=0.15, ve_gate_lr=None):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
+        # Extract ve_gate params first so they can have an independent lr
+        ve_gate_params = [p for block in self.transformer.h
+                          for p in (list(block.attn.ve_gate.parameters()) if block.attn.ve_gate is not None else [])]
+        ve_gate_param_ids = {id(p) for p in ve_gate_params}
+
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in ve_gate_param_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(ve_gate_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
+
+        _value_embeds_lr = value_embeds_lr * dmodel_lr_scale
+        _ve_gate_lr = matrix_lr if ve_gate_lr is None else ve_gate_lr
 
         # Build param_groups with all required fields explicit
         param_groups = [
             # AdamW groups (embeddings, lm_head, scalars)
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+            dict(kind='adamw', params=value_embeds_params, lr=_value_embeds_lr, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
@@ -404,6 +418,13 @@ class GPT(nn.Module):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
+                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+            ))
+        # ve_gate Muon groups (separate from matrix_params to allow independent lr tuning)
+        for shape in sorted({p.shape for p in ve_gate_params}):
+            group_params = [p for p in ve_gate_params if p.shape == shape]
+            param_groups.append(dict(
+                kind='muon', params=group_params, lr=_ve_gate_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
             ))
 

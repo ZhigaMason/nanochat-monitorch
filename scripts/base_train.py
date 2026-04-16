@@ -80,6 +80,10 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# value embeddings / ve_gate
+parser.add_argument("--ve-gate-relu", action="store_true", help="replace 3*sigmoid gate with relu in value embedding gate")
+parser.add_argument("--value-embeds-lr", type=float, default=0.15, help="lr for value embeddings (reference scale, will be multiplied by dmodel_lr_scale)")
+parser.add_argument("--ve-gate-lr", type=float, default=-1.0, help="lr for ve_gate weights (-1 = matrix_lr)")
 # monitorch
 parser.add_argument("--tick-every", type=int, default=100, help="Tick inspector every")
 # parser.add_argument("--is-active", type=int, default=1, help="Passed to is_active_fn of monitorch.PyTorchInspector")
@@ -317,9 +321,11 @@ optimizer = model.setup_optimizer(
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
+    value_embeds_lr=args.value_embeds_lr * batch_lr_scale,
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    ve_gate_lr=None if args.ve_gate_lr < 0 else args.ve_gate_lr * batch_lr_scale,
 )
 
 if resuming:
