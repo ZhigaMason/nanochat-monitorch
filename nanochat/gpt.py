@@ -377,7 +377,7 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, value_embeds_lr=0.15, ve_gate_lr=None):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, value_embeds_lr=0.15, ve_gate_lr=None, matrix_momentum=None):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -402,6 +402,7 @@ class GPT(nn.Module):
 
         _value_embeds_lr = value_embeds_lr * dmodel_lr_scale
         _ve_gate_lr = matrix_lr if ve_gate_lr is None else ve_gate_lr
+        _matrix_momentum = 0.95 if matrix_momentum is None else matrix_momentum
 
         # Build param_groups with all required fields explicit
         param_groups = [
@@ -417,15 +418,17 @@ class GPT(nn.Module):
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                kind='muon', subkind='matrix', params=group_params, lr=matrix_lr,
+                momentum=_matrix_momentum, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                use_momentum_schedule=matrix_momentum is None,
             ))
-        # ve_gate Muon groups (separate from matrix_params to allow independent lr tuning)
+        # ve_gate Muon groups (separate from matrix_params to allow independent lr/momentum tuning)
         for shape in sorted({p.shape for p in ve_gate_params}):
             group_params = [p for p in ve_gate_params if p.shape == shape]
             param_groups.append(dict(
-                kind='muon', params=group_params, lr=_ve_gate_lr,
+                kind='muon', subkind='ve_gate', params=group_params, lr=_ve_gate_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                use_momentum_schedule=True,
             ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW

@@ -84,6 +84,10 @@ parser.add_argument("--model-tag", type=str, default=None, help="override model 
 parser.add_argument("--ve-gate-relu", action="store_true", help="replace 3*sigmoid gate with relu in value embedding gate")
 parser.add_argument("--value-embeds-lr", type=float, default=0.15, help="lr for value embeddings (reference scale, will be multiplied by dmodel_lr_scale)")
 parser.add_argument("--ve-gate-lr", type=float, default=-1.0, help="lr for ve_gate weights (-1 = matrix_lr)")
+parser.add_argument("--matrix-momentum", type=float, default=-1.0, help="fixed momentum for matrix Muon groups (-1 = use momentum schedule)")
+parser.add_argument("--ve-gate-momentum-start", type=float, default=0.85, help="ve_gate momentum at beginning of warmup")
+parser.add_argument("--ve-gate-momentum-peak", type=float, default=0.97, help="ve_gate momentum during stable training phase")
+parser.add_argument("--ve-gate-momentum-final", type=float, default=0.90, help="ve_gate momentum at end of warmdown")
 # monitorch
 parser.add_argument("--tick-every", type=int, default=100, help="Tick inspector every")
 # parser.add_argument("--is-active", type=int, default=1, help="Passed to is_active_fn of monitorch.PyTorchInspector")
@@ -326,6 +330,7 @@ optimizer = model.setup_optimizer(
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
     ve_gate_lr=None if args.ve_gate_lr < 0 else args.ve_gate_lr * batch_lr_scale,
+    matrix_momentum=None if args.matrix_momentum < 0 else args.matrix_momentum,
 )
 
 if resuming:
@@ -393,6 +398,22 @@ def get_muon_momentum(it):
         return 0.97 * (1 - progress) + 0.90 * progress
     else:
         return 0.97
+
+# Separate momentum scheduler for ve_gate Muon groups (same shape as get_muon_momentum, independently tunable)
+def get_ve_gate_momentum(it):
+    warmdown_iters = round(args.warmdown_ratio * num_iterations)
+    warmdown_start = num_iterations - warmdown_iters
+    m_start = args.ve_gate_momentum_start
+    m_peak  = args.ve_gate_momentum_peak
+    m_final = args.ve_gate_momentum_final
+    if it < 400:
+        frac = it / 400
+        return (1 - frac) * m_start + frac * m_peak
+    elif it >= warmdown_start:
+        progress = (it - warmdown_start) / warmdown_iters
+        return m_peak * (1 - progress) + m_final * progress
+    else:
+        return m_peak
 
 # Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
 def get_weight_decay(it):
@@ -548,11 +569,13 @@ while True:
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
+    ve_gate_momentum = get_ve_gate_momentum(step)
     muon_weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
+            if group.get('use_momentum_schedule', True):
+                group["momentum"] = ve_gate_momentum if group.get('subkind') == 've_gate' else muon_momentum
             group["weight_decay"] = muon_weight_decay
     if scaler is not None:
         scaler.unscale_(optimizer)

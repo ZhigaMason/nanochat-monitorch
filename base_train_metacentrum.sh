@@ -19,6 +19,6 @@ python -m scripts.tok_eval
 
 torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
   --depth=12 --device-batch-size=4 --window-pattern=L --run=monitorch-small \
-  --ve-gate-relu
+  --ve-gate-relu --ve-gate-momentum-start=0.82 --ve-gate-momentum-peak=0.87 --ve-gate-momentum-final=0.85
 
 # kindly stolen from https://github.com/karpathy/nanochat/discussions/677
