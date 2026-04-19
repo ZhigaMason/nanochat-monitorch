@@ -39,6 +39,8 @@ class GPTConfig:
     window_pattern: str = "SSSL"
     # Use ReLU instead of 3*sigmoid for the value embedding gate (unbounded, easier to train)
     ve_gate_relu: bool = False
+    # Dropout rate applied to value embeddings (0.0 = disabled)
+    ve_dropout: float = 0.0
 
 
 def norm(x):
@@ -480,6 +482,8 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            if ve is not None and self.config.ve_dropout > 0.0:
+                ve = F.dropout(ve, p=self.config.ve_dropout, training=self.training)
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x

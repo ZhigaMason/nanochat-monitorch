@@ -82,6 +82,7 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 # value embeddings / ve_gate
 parser.add_argument("--ve-gate-relu", action="store_true", help="replace 3*sigmoid gate with relu in value embedding gate")
+parser.add_argument("--ve-dropout", type=float, default=0.0, help="dropout rate applied to value embeddings during training (0.0 = disabled)")
 parser.add_argument("--value-embeds-lr", type=float, default=0.15, help="lr for value embeddings (reference scale, will be multiplied by dmodel_lr_scale)")
 parser.add_argument("--ve-gate-lr", type=float, default=-1.0, help="lr for ve_gate weights (-1 = matrix_lr)")
 parser.add_argument("--matrix-momentum", type=float, default=-1.0, help="fixed momentum for matrix Muon groups (-1 = use momentum schedule)")
@@ -152,6 +153,8 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        ve_gate_relu=args.ve_gate_relu,
+        ve_dropout=args.ve_dropout,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
