@@ -91,6 +91,7 @@ parser.add_argument("--ve-gate-momentum-peak", type=float, default=0.97, help="v
 parser.add_argument("--ve-gate-momentum-final", type=float, default=0.90, help="ve_gate momentum at end of warmdown")
 # monitorch
 parser.add_argument("--tick-every", type=int, default=100, help="Tick inspector every")
+parser.add_argument("--log-file", type=str, default='logs.pkl', help="Name of the log file")
 # parser.add_argument("--is-active", type=int, default=1, help="Passed to is_active_fn of monitorch.PyTorchInspector")
 
 args = parser.parse_args()
@@ -459,7 +460,7 @@ inspector = PyTorchInspector(
             lens.ParameterNorm(parameters=['weight']),
         ],
         is_active_fn=lambda n: model.training, # we are interested only in training values
-        visualizer=RecorderVisualizer('logs.pkl')
+        visualizer=RecorderVisualizer(args.log_file)
 )
 
 # Go!
