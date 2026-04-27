@@ -46,6 +46,7 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--seed", type=int, default=42, help="random seed (override the default 42 for repeated runs)")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
@@ -90,6 +91,7 @@ parser.add_argument("--ve-gate-momentum-start", type=float, default=0.85, help="
 parser.add_argument("--ve-gate-momentum-peak", type=float, default=0.97, help="ve_gate momentum during stable training phase")
 parser.add_argument("--ve-gate-momentum-final", type=float, default=0.90, help="ve_gate momentum at end of warmdown")
 # monitorch
+parser.add_argument("--monitor", default=False, action="store_true", help="Do monitorch monitoring.")
 parser.add_argument("--tick-every", type=int, default=100, help="Tick inspector every")
 parser.add_argument("--log-file", type=str, default='logs.pkl', help="Name of the log file")
 # parser.add_argument("--is-active", type=int, default=1, help="Passed to is_active_fn of monitorch.PyTorchInspector")
@@ -102,6 +104,11 @@ user_config = vars(args).copy()  # for logging
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+# Override compute_init's hardcoded seed=42 so repeated runs can vary.
+torch.manual_seed(args.seed)
+if device_type == "cuda":
+    torch.cuda.manual_seed_all(args.seed)
+print0(f"Random seed: {args.seed}")
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 if device_type == "cuda":
@@ -450,18 +457,19 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
-inspector = PyTorchInspector(
-        module = model,
-        lenses=[
-            lens.LossMetrics(loss_fn=model),
-            lens.ParameterGradientActivation(parameters=['weight']),
-            lens.ParameterGradientGeometry(parameters=['weight']),
-            lens.ParameterUpdateGeometry(optimizer=optimizer, parameters=['weight']),
-            lens.ParameterNorm(parameters=['weight']),
-        ],
-        is_active_fn=lambda n: model.training, # we are interested only in training values
-        visualizer=RecorderVisualizer(args.log_file)
-)
+if args.monitor:
+    inspector = PyTorchInspector(
+            module = model,
+            lenses=[
+                lens.LossMetrics(loss_fn=model),
+                lens.ParameterGradientActivation(parameters=['weight']),
+                lens.ParameterGradientGeometry(parameters=['weight']),
+                lens.ParameterUpdateGeometry(optimizer=optimizer, parameters=['weight']),
+                lens.ParameterNorm(parameters=['weight']),
+            ],
+            is_active_fn=lambda n: model.training, # we are interested only in training values
+            visualizer=RecorderVisualizer(args.log_file)
+    )
 
 # Go!
 while True:
@@ -485,7 +493,6 @@ while True:
             "val/bpb": val_bpb,
         })
         model.train()
-        inspector.push_metric('val_pbp', val_bpb)
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
@@ -550,7 +557,7 @@ while True:
             rank=ddp_rank,
         )
 
-    if last_step or (step > 0 and step % args.tick_every == 0):
+    if args.monitor and (last_step or (step > 0 and step % args.tick_every == 0)):
         inspector.tick()
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
