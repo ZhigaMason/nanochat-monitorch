@@ -342,6 +342,7 @@ optimizer = model.setup_optimizer(
     weight_decay=weight_decay_scaled,
     ve_gate_lr=None if args.ve_gate_lr < 0 else args.ve_gate_lr * batch_lr_scale,
     matrix_momentum=None if args.matrix_momentum < 0 else args.matrix_momentum,
+    use_coupled_adamw=True,
 )
 
 if resuming:

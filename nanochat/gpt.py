@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
-from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.optim import MultiOptimizer, DistMultiOptimizer
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -379,65 +379,89 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, value_embeds_lr=0.15, ve_gate_lr=None, matrix_momentum=None):
-        model_dim = self.config.n_embd
-        ddp, rank, local_rank, world_size = get_dist_info()
+    def setup_optimizer(
+            self, 
+            unembedding_lr=0.004, 
+            embedding_lr=0.2, 
+            matrix_lr=0.02, 
+            weight_decay=0.0, 
+            scalar_lr=0.5, 
+            value_embeds_lr=0.15, 
+            ve_gate_lr=None, 
+            matrix_momentum=None,
+            use_coupled_adamw=False,  # <-- Added flag
+            coupled_lambda=0.1        # <-- Added coupling strength
+        ):
+            model_dim = self.config.n_embd
+            ddp, rank, local_rank, world_size = get_dist_info()
 
-        # Extract ve_gate params first so they can have an independent lr
-        ve_gate_params = [p for block in self.transformer.h
-                          for p in (list(block.attn.ve_gate.parameters()) if block.attn.ve_gate is not None else [])]
-        ve_gate_param_ids = {id(p) for p in ve_gate_params}
+            # Extract ve_gate params first so they can have an independent lr
+            ve_gate_params = [p for block in self.transformer.h
+                              for p in (list(block.attn.ve_gate.parameters()) if block.attn.ve_gate is not None else [])]
+            ve_gate_param_ids = {id(p) for p in ve_gate_params}
 
-        # Separate out all parameters into groups
-        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in ve_gate_param_ids]
-        value_embeds_params = list(self.value_embeds.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(ve_gate_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+            # Separate out all parameters into groups
+            matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in ve_gate_param_ids]
+            value_embeds_params = list(self.value_embeds.parameters())
+            embedding_params = list(self.transformer.wte.parameters())
+            lm_head_params = list(self.lm_head.parameters())
+            resid_params = [self.resid_lambdas]
+            x0_params = [self.x0_lambdas]
+            smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
+            assert len(list(self.parameters())) == len(matrix_params) + len(ve_gate_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
-        # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
-        dmodel_lr_scale = (model_dim / 768) ** -0.5
-        print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
+            # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
+            dmodel_lr_scale = (model_dim / 768) ** -0.5
+            print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
-        _value_embeds_lr = value_embeds_lr * dmodel_lr_scale
-        _ve_gate_lr = matrix_lr if ve_gate_lr is None else ve_gate_lr
-        _matrix_momentum = 0.95 if matrix_momentum is None else matrix_momentum
+            _value_embeds_lr = value_embeds_lr * dmodel_lr_scale
+            _ve_gate_lr = matrix_lr if ve_gate_lr is None else ve_gate_lr
+            _matrix_momentum = 0.95 if matrix_momentum is None else matrix_momentum
 
-        # Build param_groups with all required fields explicit
-        param_groups = [
-            # AdamW groups (embeddings, lm_head, scalars)
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            dict(kind='adamw', params=value_embeds_params, lr=_value_embeds_lr, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
-            dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
-        ]
-        # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', subkind='matrix', params=group_params, lr=matrix_lr,
-                momentum=_matrix_momentum, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
-                use_momentum_schedule=matrix_momentum is None,
-            ))
-        # ve_gate Muon groups (separate from matrix_params to allow independent lr/momentum tuning)
-        for shape in sorted({p.shape for p in ve_gate_params}):
-            group_params = [p for p in ve_gate_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', subkind='ve_gate', params=group_params, lr=_ve_gate_lr,
-                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
-                use_momentum_schedule=True,
-            ))
+            # Determine optimizer kind for embeddings based on the flag
+            embedding_kind = 'coupled_adamw' if use_coupled_adamw else 'adamw'
+            if use_coupled_adamw:
+                print0(f"Using Coupled AdamW for wte and ve embeddings with lambda={coupled_lambda}")
 
-        Factory = DistMuonAdamW if ddp else MuonAdamW
-        optimizer = Factory(param_groups)
-        for group in optimizer.param_groups:
-            group["initial_lr"] = group["lr"]
-        return optimizer
+            # Build param_groups with all required fields explicit
+            param_groups = [
+                # Standard AdamW groups (lm_head, scalars)
+                dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
+                dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
+                dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
+                dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+                
+                # Embedding groups (routes to Coupled AdamW if flag is True)
+                dict(kind=embedding_kind, params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001, coupled_lambda=coupled_lambda),
+                dict(kind=embedding_kind, params=value_embeds_params, lr=_value_embeds_lr, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01, coupled_lambda=coupled_lambda),
+            ]
+            
+            # Muon groups (matrix params, grouped by shape for stacking)
+            for shape in sorted({p.shape for p in matrix_params}):
+                group_params = [p for p in matrix_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', subkind='matrix', params=group_params, lr=matrix_lr,
+                    momentum=_matrix_momentum, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                    use_momentum_schedule=matrix_momentum is None,
+                ))
+                
+            # ve_gate Muon groups (separate from matrix_params to allow independent lr/momentum tuning)
+            for shape in sorted({p.shape for p in ve_gate_params}):
+                group_params = [p for p in ve_gate_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', subkind='ve_gate', params=group_params, lr=_ve_gate_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                    use_momentum_schedule=True,
+                ))
+
+            # Replaced Factory with the new MultiOptimizer classes
+            Factory = DistMultiOptimizer if ddp else MultiOptimizer
+            optimizer = Factory(param_groups)
+            
+            for group in optimizer.param_groups:
+                group["initial_lr"] = group["lr"]
+                
+            return optimizer
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
