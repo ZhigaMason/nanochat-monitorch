@@ -1,6 +1,8 @@
 """
 A highly efficient Multi-Optimizer combining Muon, standard AdamW, and Coupled AdamW.
-Hardened against async memory corruption and torch.compile scalar casting bugs.
+- 'muon': For 2D matrix parameters (Transformer blocks, MLPs).
+- 'coupled_adamw': For anisotropic-prone 2D Embeddings (wte, ve).
+- 'adamw': For general scalars, biases, and final LayerNorms.
 """
 
 import torch
@@ -13,34 +15,54 @@ from nanochat.common import COMPUTE_DTYPE
 # -----------------------------------------------------------------------------
 
 @torch.compile(dynamic=False, fullgraph=True)
-def coupled_adamw_step_fused(
+def adamw_step_fused(
     p: Tensor, grad: Tensor, exp_avg: Tensor, exp_avg_sq: Tensor,
-    step_t: Tensor, lr_t: Tensor, beta1_t: Tensor, beta2_t: Tensor,
-    eps_t: Tensor, wd_t: Tensor, lambda_t: Tensor,
+    step_t: Tensor, lr: float, beta1: float, beta2: float,
+    eps: float, wd: float,
 ) -> None:
-    # Weight decay
-    p.mul_(1 - lr_t * wd_t)
+    """Standard AdamW Fused Kernel"""
+    # 1. Cast grad to parameter dtype for safety
+    grad_cast = grad.to(p.dtype)
     
-    # Momentum
-    exp_avg.lerp_(grad, 1 - beta1_t)
+    p.mul_(1.0 - lr * wd)
+    exp_avg.lerp_(grad_cast, 1.0 - beta1)
+    exp_avg_sq.lerp_(grad_cast.square(), 1.0 - beta2)
     
-    # Coupled Second Moment Calculation
-    # SAFE MATH: Using explicit multiplication instead of .add_(..., alpha=lambda_t)
-    # to prevent C++ scalar casting memory bugs inside torch.compile
-    coupled_grad_sq = grad.square() + exp_avg.square() * lambda_t
-    exp_avg_sq.lerp_(coupled_grad_sq, 1 - beta2_t)
+    bias1 = 1.0 - beta1 ** step_t
+    bias2 = 1.0 - beta2 ** step_t
     
-    # Bias corrections
-    bias1 = 1 - beta1_t ** step_t
-    bias2 = 1 - beta2_t ** step_t
+    denom = (exp_avg_sq / bias2).sqrt() + eps
+    step_size = lr / bias1
     
-    # Compute update
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
-    
-    # SAFE UPDATE: Avoid alpha=Tensor kwarg which causes dispatcher heap corruption
     update = (exp_avg / denom) * step_size
     p.sub_(update)
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def coupled_adamw_step_fused(
+    p: Tensor, grad: Tensor, exp_avg: Tensor, exp_avg_sq: Tensor,
+    step_t: Tensor, lr: float, beta1: float, beta2: float,
+    eps: float, wd: float, avg_scale: float
+) -> None:
+    """Coupled AdamW Fused Kernel"""
+    grad_cast = grad.to(p.dtype)
+
+    p.mul_(1.0 - lr * wd)
+    
+    exp_avg.lerp_(grad_cast, 1.0 - beta1)
+    exp_avg_sq.lerp_(grad_cast.square(), 1.0 - beta2)
+    
+    coupled_v = exp_avg_sq.mean(dim=0, keepdim=True) * avg_scale
+    
+    bias1 = 1.0 - (beta1 ** step_t)
+    bias2 = 1.0 - (beta2 ** step_t)
+    
+    denom = (coupled_v / bias2).sqrt() + eps
+    step_size = lr / bias1
+    
+    update = (exp_avg / denom) * step_size
+    p.sub_(update)
+
 
 polar_express_coeffs = [
     (8.156554524902461, -22.48329292557795, 15.878769915207462),
@@ -53,11 +75,11 @@ polar_express_coeffs = [
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(
     stacked_grads: Tensor, stacked_params: Tensor, momentum_buffer: Tensor,
-    second_momentum_buffer: Tensor, momentum_t: Tensor, lr_t: Tensor,
-    wd_t: Tensor, beta2_t: Tensor, ns_steps: int, red_dim: int,
+    second_momentum_buffer: Tensor, momentum: float, lr: float,
+    wd: float, beta2: float, ns_steps: int, red_dim: int,
 ) -> None:
-    momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    """Muon Orthogonalization Fused Kernel"""
+    momentum_buffer.lerp_(stacked_grads, 1.0 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
     X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
@@ -74,23 +96,21 @@ def muon_step_fused(
             X = a * X + B @ X
     g = X
 
-    beta2 = beta2_t.to(g.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1.0 - beta2)
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
 
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
     
-    # Safe fallback update
     update = lr * g + lr * wd * stacked_params * mask
     stacked_params.sub_(update)
 
@@ -102,51 +122,41 @@ def muon_step_fused(
 class MultiOptimizer(torch.optim.Optimizer):
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
-        
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lambda_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        # Removed the self._*_t CPU tensors that caused the glibc tcache crash
 
     def _step_adam_variant(self, group: dict, is_coupled: bool) -> None:
         for p in group['params']:
-            if p.grad is None: # Critical for smoke tests
+            if p.grad is None: 
                 continue
             grad = p.grad
             state = self.state[p]
 
             if not state:
-                state['step'] = 0
+                # Store step as a persistent device tensor to avoid Python GC race condition
+                state['step_t'] = torch.tensor(0.0, dtype=torch.float32, device=p.device)
                 state['exp_avg'] = torch.zeros_like(p)
                 state['exp_avg_sq'] = torch.zeros_like(p)
-            state['step'] += 1
+                
+            state['step_t'] += 1.0
 
-            self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group['lr'])
-            self._adamw_beta1_t.fill_(group['betas'][0])
-            self._adamw_beta2_t.fill_(group['betas'][1])
-            self._adamw_eps_t.fill_(group['eps'])
-            self._adamw_wd_t.fill_(group['weight_decay'])
+            # Extract statically to Python floats to pass to compiled kernel
+            lr = float(group['lr'])
+            beta1 = float(group['betas'][0])
+            beta2 = float(group['betas'][1])
+            eps = float(group['eps'])
+            wd = float(group['weight_decay'])
             
             if is_coupled:
-                self._adamw_lambda_t.fill_(group.get('coupled_lambda', 0.1))
+                avg_scale = float(group.get('avg_scale', 1.0))
+                coupled_adamw_step_fused(
+                    p, grad, state['exp_avg'], state['exp_avg_sq'],
+                    state['step_t'], lr, beta1, beta2, eps, wd, avg_scale
+                )
             else:
-                self._adamw_lambda_t.fill_(0.0)
-
-            coupled_adamw_step_fused(
-                p, grad, state['exp_avg'], state['exp_avg_sq'],
-                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
-                self._adamw_lambda_t
-            )
+                adamw_step_fused(
+                    p, grad, state['exp_avg'], state['exp_avg_sq'],
+                    state['step_t'], lr, beta1, beta2, eps, wd
+                )
 
     def _step_muon(self, group: dict) -> None:
         params = [p for p in group['params'] if p.grad is not None]
@@ -171,15 +181,15 @@ class MultiOptimizer(torch.optim.Optimizer):
         stacked_grads = torch.stack([p.grad for p in params])
         stacked_params = torch.stack(params)
 
-        self._muon_momentum_t.fill_(group["momentum"])
-        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-        self._muon_wd_t.fill_(group["weight_decay"])
+        # Pass pure floats to avoid concurrency issues with the C++ backend
+        momentum = float(group["momentum"])
+        beta2 = float(group["beta2"] if group["beta2"] is not None else 0.0)
+        lr = float(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+        wd = float(group["weight_decay"])
 
         muon_step_fused(
             stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-            self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-            group["ns_steps"], red_dim,
+            momentum, lr, wd, beta2, group["ns_steps"], red_dim,
         )
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
@@ -204,18 +214,7 @@ class MultiOptimizer(torch.optim.Optimizer):
 class DistMultiOptimizer(torch.optim.Optimizer):
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lambda_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        # Removed the self._*_t CPU tensors that caused the glibc tcache crash
 
     def _reduce_adam_variant(self, group: dict, world_size: int) -> dict:
         param_infos = {}
@@ -273,33 +272,32 @@ class DistMultiOptimizer(torch.optim.Optimizer):
                 p_slice = p[rank * rank_size:(rank + 1) * rank_size]
 
             if not state:
-                state['step'] = 0
+                state['step_t'] = torch.tensor(0.0, dtype=torch.float32, device=p_slice.device)
                 state['exp_avg'] = torch.zeros_like(p_slice)
                 state['exp_avg_sq'] = torch.zeros_like(p_slice)
-            state['step'] += 1
+                
+            state['step_t'] += 1.0
 
-            self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group['lr'])
-            self._adamw_beta1_t.fill_(group['betas'][0])
-            self._adamw_beta2_t.fill_(group['betas'][1])
-            self._adamw_eps_t.fill_(group['eps'])
-            self._adamw_wd_t.fill_(group['weight_decay'])
+            lr = float(group['lr'])
+            beta1 = float(group['betas'][0])
+            beta2 = float(group['betas'][1])
+            eps = float(group['eps'])
+            wd = float(group['weight_decay'])
             
             if is_coupled:
-                self._adamw_lambda_t.fill_(group.get('coupled_lambda', 0.1))
+                avg_scale = float(group.get('avg_scale', 1.0))
+                coupled_adamw_step_fused(
+                    p_slice, grad_slice, state['exp_avg'], state['exp_avg_sq'],
+                    state['step_t'], lr, beta1, beta2, eps, wd, avg_scale
+                )
             else:
-                self._adamw_lambda_t.fill_(0.0)
-
-            coupled_adamw_step_fused(
-                p_slice, grad_slice, state['exp_avg'], state['exp_avg_sq'],
-                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
-                self._adamw_lambda_t
-            )
+                adamw_step_fused(
+                    p_slice, grad_slice, state['exp_avg'], state['exp_avg_sq'],
+                    state['step_t'], lr, beta1, beta2, eps, wd
+                )
 
             if not pinfo['is_small']:
                 future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
-                # Added 'hold' to prevent GC from freeing the tensor memory during background NCCL
                 gather_list.append(dict(future=future, params=None, hold_buffer=p_slice))
 
     def _compute_muon(self, group: dict, info: dict, gather_list: list, rank: int) -> None:
@@ -330,16 +328,15 @@ class DistMultiOptimizer(torch.optim.Optimizer):
             owned_params = [params[start_idx + i] for i in range(num_owned)]
             stacked_owned = torch.stack(owned_params)
 
-            self._muon_momentum_t.fill_(group["momentum"])
-            self._muon_beta2_t.fill_(group["beta2"])
-            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-            self._muon_wd_t.fill_(group["weight_decay"])
+            momentum = float(group["momentum"])
+            beta2 = float(group["beta2"])
+            lr = float(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+            wd = float(group["weight_decay"])
             
             muon_step_fused(
                 grad_chunk[:num_owned], stacked_owned,
                 state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                group["ns_steps"], red_dim,
+                momentum, lr, wd, beta2, group["ns_steps"], red_dim,
             )
             updated_params[:num_owned].copy_(stacked_owned)
 
@@ -349,7 +346,6 @@ class DistMultiOptimizer(torch.optim.Optimizer):
         stacked_params = info["stacked_grads"]
         future = dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True).get_future()
         
-        # Added 'hold' to prevent GC from freeing the tensor memory during background NCCL
         gather_list.append(dict(future=future, stacked_params=stacked_params, params=params, hold_buffer=updated_params))
 
     def _finish_gathers(self, gather_list: list) -> None:

@@ -390,7 +390,7 @@ class GPT(nn.Module):
             ve_gate_lr=None, 
             matrix_momentum=None,
             use_coupled_adamw=False,  # <-- Added flag
-            coupled_lambda=0.1        # <-- Added coupling strength
+            avg_scale=1.0             # <-- Changed from coupled_lambda to avg_scale
         ):
             model_dim = self.config.n_embd
             ddp, rank, local_rank, world_size = get_dist_info()
@@ -421,7 +421,7 @@ class GPT(nn.Module):
             # Determine optimizer kind for embeddings based on the flag
             embedding_kind = 'coupled_adamw' if use_coupled_adamw else 'adamw'
             if use_coupled_adamw:
-                print0(f"Using Coupled AdamW for wte and ve embeddings with lambda={coupled_lambda}")
+                print0(f"Using Coupled AdamW for wte and ve embeddings with avg_scale={avg_scale}")
 
             # Build param_groups with all required fields explicit
             param_groups = [
@@ -432,8 +432,8 @@ class GPT(nn.Module):
                 dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
                 
                 # Embedding groups (routes to Coupled AdamW if flag is True)
-                dict(kind=embedding_kind, params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001, coupled_lambda=coupled_lambda),
-                dict(kind=embedding_kind, params=value_embeds_params, lr=_value_embeds_lr, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01, coupled_lambda=coupled_lambda),
+                dict(kind=embedding_kind, params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001, avg_scale=avg_scale),
+                dict(kind=embedding_kind, params=value_embeds_params, lr=_value_embeds_lr, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01, avg_scale=avg_scale),
             ]
             
             # Muon groups (matrix params, grouped by shape for stacking)
