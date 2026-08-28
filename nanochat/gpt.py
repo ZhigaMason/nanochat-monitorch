@@ -41,6 +41,10 @@ class GPTConfig:
     ve_gate_relu: bool = False
     # Dropout rate applied to value embeddings (0.0 = disabled)
     ve_dropout: float = 0.0
+    # Dropout rate on the attention probabilities (0.0 = disabled). SDPA only: FA3 has no dropout support.
+    attn_dropout: float = 0.0
+    # Dropout rate on the MLP hidden activations, after relu^2 (0.0 = disabled)
+    mlp_dropout: float = 0.0
 
 
 def norm(x):
@@ -83,6 +87,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
         self.ve_gate_relu = config.ve_gate_relu
+        self.attn_dropout = config.attn_dropout
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -113,7 +118,8 @@ class CausalSelfAttention(nn.Module):
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            dropout_p = self.attn_dropout if self.training else 0.0
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, dropout_p=dropout_p)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -139,10 +145,13 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.mlp_dropout = config.mlp_dropout
 
     def forward(self, x):
         x = self.c_fc(x)
         x = F.relu(x).square()
+        if self.mlp_dropout > 0.0:
+            x = F.dropout(x, p=self.mlp_dropout, training=self.training)
         x = self.c_proj(x)
         return x
 

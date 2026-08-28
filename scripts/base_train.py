@@ -84,6 +84,9 @@ parser.add_argument("--model-tag", type=str, default=None, help="override model 
 # value embeddings / ve_gate
 parser.add_argument("--ve-gate-relu", action="store_true", help="replace 3*sigmoid gate with relu in value embedding gate")
 parser.add_argument("--ve-dropout", type=float, default=0.0, help="dropout rate applied to value embeddings during training (0.0 = disabled)")
+# block dropout (control experiment for --ve-dropout)
+parser.add_argument("--attn-dropout", type=float, default=0.0, help="dropout rate on attention probabilities during training (0.0 = disabled). SDPA only, unsupported on FA3/Hopper")
+parser.add_argument("--mlp-dropout", type=float, default=0.0, help="dropout rate on MLP hidden activations during training (0.0 = disabled)")
 parser.add_argument("--value-embeds-lr", type=float, default=0.15, help="lr for value embeddings (reference scale, will be multiplied by dmodel_lr_scale)")
 parser.add_argument("--ve-gate-lr", type=float, default=-1.0, help="lr for ve_gate weights (-1 = matrix_lr)")
 parser.add_argument("--matrix-momentum", type=float, default=-1.0, help="fixed momentum for matrix Muon groups (-1 = use momentum schedule)")
@@ -163,6 +166,8 @@ def build_model_meta(depth):
         window_pattern=args.window_pattern,
         ve_gate_relu=args.ve_gate_relu,
         ve_dropout=args.ve_dropout,
+        attn_dropout=args.attn_dropout,
+        mlp_dropout=args.mlp_dropout,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
